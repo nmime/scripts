@@ -20,6 +20,7 @@ SHARDS_DIR="${WORKDIR}/shards"
 MERGED_DIR="${WORKDIR}/merged"
 MERGED_MODEL="${MERGED_DIR}/huihui-glm-5.1-abliterated.Q3_K.gguf"
 API_KEY_FILE="${WORKDIR}/api_key"
+READY_JSON="${WORKDIR}/ready.json"
 ARIA2_INPUT="${WORKDIR}/hf-aria2-input.txt"
 HF_FILE_LIST="${WORKDIR}/hf-files.txt"
 
@@ -273,8 +274,91 @@ prepare_api_key() {
   chmod 600 "${API_KEY_FILE}"
 }
 
+write_ready_json() {
+  local public_host="${PUBLIC_IPADDR:-}"
+  local public_port="${VAST_TCP_PORT_8080:-}"
+  local base_url=""
+  local chat_url=""
+  local timestamp
+  local api_key
+  local tmp_file
+
+  if [[ -n "${public_host}" && -n "${public_port}" ]]; then
+    base_url="http://${public_host}:${public_port}"
+    chat_url="${base_url}/v1/chat/completions"
+  fi
+
+  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  api_key=$(tr -d '\r\n' < "${API_KEY_FILE}")
+
+  umask 077
+  tmp_file=$(mktemp "${WORKDIR}/ready.json.tmp.XXXXXX")
+  jq -n \
+    --arg status "starting" \
+    --arg timestamp "${timestamp}" \
+    --arg model_alias "${MODEL_ALIAS}" \
+    --arg public_host "${public_host}" \
+    --arg public_port "${public_port}" \
+    --arg base_url "${base_url}" \
+    --arg chat_url "${chat_url}" \
+    --arg api_key_file "${API_KEY_FILE}" \
+    --arg api_key "${api_key}" \
+    --arg workdir "${WORKDIR}" \
+    --arg listen_host "0.0.0.0" \
+    --arg listen_port "${PORT}" \
+    '{
+      status: $status,
+      timestamp: $timestamp,
+      model_alias: $model_alias,
+      public_host: $public_host,
+      public_port: $public_port,
+      base_url: $base_url,
+      chat_url: $chat_url,
+      api_key_file: $api_key_file,
+      api_key: $api_key,
+      workdir: $workdir,
+      listen_host: $listen_host,
+      listen_port: $listen_port,
+      public_endpoint_env_mapping: {
+        public_host: "PUBLIC_IPADDR",
+        public_port_for_container_8080: "VAST_TCP_PORT_8080",
+        base_url: "http://${PUBLIC_IPADDR}:${VAST_TCP_PORT_8080}",
+        chat_url: "http://${PUBLIC_IPADDR}:${VAST_TCP_PORT_8080}/v1/chat/completions"
+      }
+    }' > "${tmp_file}"
+  chmod 600 "${tmp_file}"
+  mv "${tmp_file}" "${READY_JSON}"
+  chmod 600 "${READY_JSON}"
+  log "Wrote startup endpoint metadata to ${READY_JSON} with status starting. Public endpoint maps PUBLIC_IPADDR and VAST_TCP_PORT_8080 to container 8080."
+}
+
+post_ready_webhook() {
+  if [[ -z "${READY_WEBHOOK_URL:-}" ]]; then
+    return
+  fi
+
+  local http_code=""
+  local curl_rc=0
+  set +e
+  http_code=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    --data-binary "@${READY_JSON}" \
+    "${READY_WEBHOOK_URL}" 2>/dev/null)
+  curl_rc=$?
+  set -e
+
+  if [[ ${curl_rc} -eq 0 && "${http_code}" == 2* ]]; then
+    log "READY_WEBHOOK_URL callback succeeded with HTTP ${http_code}."
+  else
+    log "READY_WEBHOOK_URL callback failed with curl exit ${curl_rc}, HTTP ${http_code:-000}; continuing startup."
+  fi
+}
+
 start_server() {
   prepare_api_key
+  write_ready_json
+  post_ready_webhook
   log "Starting llama-server on 0.0.0.0:${PORT} with alias ${MODEL_ALIAS}. API key is stored at ${API_KEY_FILE}."
   exec "${LLAMA_DIR}/build/bin/llama-server" \
     --host 0.0.0.0 \
