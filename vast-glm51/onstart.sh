@@ -2,27 +2,36 @@
 set -Eeuo pipefail
 
 WORKDIR="${WORKDIR:-/root/huihui}"
+MODEL_ID="${MODEL_ID:-huihui-ai/Huihui-GLM-5.1-abliterated-GGUF}"
+MODEL_REPO="${MODEL_REPO:-${MODEL_ID}}"
+REV="${REV:-69821bc88f2f36680374601dfbdaf441d659920b}"
+REVISION="${REVISION:-${REV}}"
 PORT="${PORT:-8080}"
 CTX="${CTX:-4096}"
-MODEL_REPO="${MODEL_REPO:-huihui-ai/Huihui-GLM-5.1-abliterated-GGUF}"
-REVISION="${REVISION:-69821bc88f2f36680374601dfbdaf441d659920b}"
-MODEL_SUBDIR="${MODEL_SUBDIR:-Q3_K-GGUF}"
-MODEL_ALIAS="${MODEL_ALIAS:-huihui-glm-5.1-q3_k}"
-EXPECTED_SHARDS="${EXPECTED_SHARDS:-39}"
-MIN_GPU_COUNT="${MIN_GPU_COUNT:-8}"
-MIN_GPU_MEM_MIB="${MIN_GPU_MEM_MIB:-80000}"
-MIN_ROOT_FREE_GB="${MIN_ROOT_FREE_GB:-900}"
-MIN_MERGED_BYTES="${MIN_MERGED_BYTES:-322122547200}" # 300 GiB
+ARIA_CONCURRENT="${ARIA_CONCURRENT:-8}"
+ARIA_SPLIT="${ARIA_SPLIT:-8}"
+ARIA_CONN_PER_SERVER="${ARIA_CONN_PER_SERVER:-${ARIA_SPLIT}}"
+ARIA_SUMMARY_INTERVAL="${ARIA_SUMMARY_INTERVAL:-60}"
+USE_SPLIT_MODEL="${USE_SPLIT_MODEL:-1}"
+MERGE_AFTER_DOWNLOAD="${MERGE_AFTER_DOWNLOAD:-0}"
+CLEAN_RAW_AFTER_MERGE="${CLEAN_RAW_AFTER_MERGE:-0}"
+CUDA_ARCH="${CUDA_ARCH:-80}"
 
-LOG_FILE="${WORKDIR}/onstart.log"
+MODEL_PREFIX="Q3_K-GGUF"
+MODEL_PATTERN="${MODEL_PREFIX}-*.gguf"
+MODEL_ALIAS="huihui-glm-5.1-q3_k"
+EXPECTED_SHARDS="${EXPECTED_SHARDS:-39}"
+MIN_TOTAL_BYTES=$((300 * 1024 * 1024 * 1024))
+MIN_GPU_COUNT="${MIN_GPU_COUNT:-8}"
+
 LLAMA_DIR="${WORKDIR}/llama.cpp"
-SHARDS_DIR="${WORKDIR}/shards"
-MERGED_DIR="${WORKDIR}/merged"
-MERGED_MODEL="${MERGED_DIR}/huihui-glm-5.1-abliterated.Q3_K.gguf"
+MODEL_DIR="${WORKDIR}/models/${MODEL_REPO//\//__}/${REVISION}"
+MERGED_MODEL="${WORKDIR}/models/${MODEL_REPO//\//__}/${MODEL_PREFIX}.gguf"
+LOG_FILE="${WORKDIR}/onstart.log"
 API_KEY_FILE="${WORKDIR}/api_key"
 READY_JSON="${WORKDIR}/ready.json"
+READY_ENV="${WORKDIR}/ready.env"
 ARIA2_INPUT="${WORKDIR}/hf-aria2-input.txt"
-HF_FILE_LIST="${WORKDIR}/hf-files.txt"
 
 mkdir -p "${WORKDIR}"
 touch "${LOG_FILE}"
@@ -30,22 +39,14 @@ chmod 600 "${LOG_FILE}" || true
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
 log() {
-  printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
+  printf '[%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"
 }
 
 sleep_forever() {
   log "$*"
-  log "Sleeping forever so the Vast.ai instance remains inspectable. See ${LOG_FILE}."
-  sleep infinity
+  log "Sleeping forever to keep the Vast instance available for debugging."
+  while true; do sleep 3600; done
 }
-
-on_error() {
-  local rc=$?
-  local line=${BASH_LINENO[0]:-${LINENO}}
-  log "ERROR: command failed near line ${line} with exit code ${rc}."
-  sleep_forever "Startup did not complete."
-}
-trap on_error ERR
 
 require_root() {
   if [[ ${EUID} -ne 0 ]]; then
@@ -53,94 +54,84 @@ require_root() {
   fi
 }
 
-verify_gpus() {
-  log "Checking GPU count and memory before setup."
-  if ! command -v nvidia-smi >/dev/null 2>&1; then
-    sleep_forever "ERROR: nvidia-smi is not available; cannot verify GPUs."
-  fi
-
-  mapfile -t gpu_memories < <(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | awk '{print int($1)}')
-  local gpu_count=${#gpu_memories[@]}
-  if (( gpu_count < MIN_GPU_COUNT )); then
-    sleep_forever "ERROR: found ${gpu_count} GPU(s); need at least ${MIN_GPU_COUNT}."
-  fi
-
-  local min_mem=999999999
-  local mem
-  for mem in "${gpu_memories[@]}"; do
-    if (( mem < min_mem )); then
-      min_mem=${mem}
-    fi
-  done
-
-  if (( min_mem < MIN_GPU_MEM_MIB )); then
-    sleep_forever "ERROR: minimum GPU memory is ${min_mem} MiB; need at least ${MIN_GPU_MEM_MIB} MiB per GPU."
-  fi
-  log "GPU check passed: ${gpu_count} GPU(s), minimum memory ${min_mem} MiB."
-}
-
-verify_root_disk() {
-  log "Checking free disk under /root before model download."
-  local free_mib required_mib
-  free_mib=$(df -Pm /root | awk 'NR==2 {print $4}')
-  required_mib=$(( MIN_ROOT_FREE_GB * 1024 ))
-  if (( free_mib < required_mib )); then
-    sleep_forever "ERROR: /root has ${free_mib} MiB free; need at least ${required_mib} MiB (${MIN_ROOT_FREE_GB} GB)."
-  fi
-  log "Disk check passed: /root has ${free_mib} MiB free."
-}
-
-install_dependencies() {
-  log "Installing build and download dependencies."
+install_packages() {
   export DEBIAN_FRONTEND=noninteractive
+  local packages=(
+    git ca-certificates curl jq python3 python3-pip python3-venv
+    build-essential cmake ninja-build ccache aria2 openssl pciutils
+  )
+  local missing=()
+  local pkg
+  for pkg in "${packages[@]}"; do
+    dpkg -s "${pkg}" >/dev/null 2>&1 || missing+=("${pkg}")
+  done
+  if (( ${#missing[@]} == 0 )); then
+    log "Required apt packages are already installed; skipping apt install."
+    return
+  fi
   apt-get update
-  apt-get install -y --no-install-recommends \
-    git \
-    build-essential \
-    cmake \
-    ninja-build \
-    ccache \
-    pkg-config \
-    python3 \
-    python3-pip \
-    curl \
-    wget \
-    jq \
-    aria2 \
-    ca-certificates \
-    openssl \
-    libcurl4-openssl-dev \
-    git-lfs
-  git lfs install --skip-smudge --system || git lfs install --skip-smudge
+  apt-get install -y --no-install-recommends "${missing[@]}"
+}
+
+check_gpus() {
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    sleep_forever "ERROR: nvidia-smi not found. Use a CUDA devel image with NVIDIA runtime enabled."
+  fi
+
+  local gpu_count
+  gpu_count=$(nvidia-smi -L | wc -l | tr -d ' ')
+  log "Detected ${gpu_count} GPU(s)."
+  if (( gpu_count < MIN_GPU_COUNT )); then
+    sleep_forever "ERROR: expected at least ${MIN_GPU_COUNT} GPUs for this template; detected ${gpu_count}."
+  fi
+}
+
+log_config() {
+  local dynamic_vast_var="VAST_TCP_PORT_${PORT}"
+  local dynamic_vast_port="${!dynamic_vast_var:-}"
+  local fallback_vast_port=""
+  if [[ "${PORT}" == "8080" ]]; then
+    fallback_vast_port="${VAST_TCP_PORT_8080:-}"
+  fi
+
+  log "Configuration: WORKDIR=${WORKDIR}"
+  log "Configuration: MODEL_ID=${MODEL_REPO}"
+  log "Configuration: REV=${REVISION}"
+  log "Configuration: PORT=${PORT} CTX=${CTX} CUDA_ARCH=${CUDA_ARCH}"
+  log "Configuration: ARIA_CONCURRENT=${ARIA_CONCURRENT} ARIA_SPLIT=${ARIA_SPLIT} ARIA_CONN_PER_SERVER=${ARIA_CONN_PER_SERVER} ARIA_SUMMARY_INTERVAL=${ARIA_SUMMARY_INTERVAL}"
+  log "Configuration: USE_SPLIT_MODEL=${USE_SPLIT_MODEL} MERGE_AFTER_DOWNLOAD=${MERGE_AFTER_DOWNLOAD} CLEAN_RAW_AFTER_MERGE=${CLEAN_RAW_AFTER_MERGE}"
+  log "Configuration: PUBLIC_IPADDR=${PUBLIC_IPADDR:-<unset>} ${dynamic_vast_var}=${dynamic_vast_port:-<unset>} VAST_TCP_PORT_8080=${fallback_vast_port:-${VAST_TCP_PORT_8080:-<unset>}}"
+  log "Configuration: LLAMA_API_KEY=$([[ -n "${LLAMA_API_KEY:-}" ]] && printf '<set>' || printf '<unset>') HF_TOKEN=$([[ -n "${HF_TOKEN:-}" ]] && printf '<set>' || printf '<unset>') READY_WEBHOOK_URL=$([[ -n "${READY_WEBHOOK_URL:-}" ]] && printf '<set>' || printf '<unset>')"
 }
 
 clone_or_update_llama_cpp() {
-  log "Cloning/updating latest ggml-org/llama.cpp."
+  if [[ -x "${LLAMA_DIR}/build/bin/llama-server" && -x "${LLAMA_DIR}/build/bin/llama-gguf-split" ]]; then
+    log "llama.cpp build already contains llama-server and llama-gguf-split; skipping rebuild."
+    return
+  fi
+
   if [[ -d "${LLAMA_DIR}/.git" ]]; then
-    git -C "${LLAMA_DIR}" fetch --depth 1 origin
-    git -C "${LLAMA_DIR}" remote set-head origin -a || true
+    log "Updating existing llama.cpp checkout."
+    git -C "${LLAMA_DIR}" fetch --depth 1 --filter=blob:none origin
     local default_ref
     default_ref=$(git -C "${LLAMA_DIR}" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)
     default_ref="${default_ref:-master}"
+    git -C "${LLAMA_DIR}" checkout "${default_ref}"
     git -C "${LLAMA_DIR}" reset --hard "origin/${default_ref}"
-    git -C "${LLAMA_DIR}" clean -fdx
   else
-    git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "${LLAMA_DIR}"
+    log "Cloning llama.cpp with shallow partial clone."
+    git clone --depth 1 --filter=blob:none https://github.com/ggml-org/llama.cpp.git "${LLAMA_DIR}"
   fi
-}
 
-build_llama_cpp() {
-  log "Building llama.cpp with CUDA and curl support."
+  log "Configuring llama.cpp CUDA build for CUDA architecture ${CUDA_ARCH}."
   cmake -S "${LLAMA_DIR}" -B "${LLAMA_DIR}/build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DGGML_CUDA=ON \
-    -DLLAMA_CURL=ON \
+    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
     -DCMAKE_C_COMPILER_LAUNCHER=ccache \
     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+  log "Building llama-server, llama-cli, and llama-gguf-split only."
   cmake --build "${LLAMA_DIR}/build" --config Release --target llama-server llama-cli llama-gguf-split --parallel "$(nproc)"
-  test -x "${LLAMA_DIR}/build/bin/llama-server"
-  test -x "${LLAMA_DIR}/build/bin/llama-cli"
-  test -x "${LLAMA_DIR}/build/bin/llama-gguf-split"
 }
 
 hf_curl_args() {
@@ -149,225 +140,272 @@ hf_curl_args() {
   fi
 }
 
-create_hf_file_list() {
-  log "Fetching Hugging Face file list for ${MODEL_REPO} at pinned revision ${REVISION}."
-  local api_url="https://huggingface.co/api/models/${MODEL_REPO}/revision/${REVISION}"
-  local tmp_json="${WORKDIR}/hf-model.json"
+discover_shards() {
+  mkdir -p "${MODEL_DIR}"
+  local tmp_json="${WORKDIR}/hf-model-files.json"
+  local api_url="https://huggingface.co/api/models/${MODEL_REPO}/tree/${REVISION}?recursive=1"
 
+  log "Discovering GGUF shards from Hugging Face API."
   if [[ -n "${HF_TOKEN:-}" ]]; then
     curl -fsSL -H "Authorization: Bearer ${HF_TOKEN}" "${api_url}" -o "${tmp_json}"
   else
     curl -fsSL "${api_url}" -o "${tmp_json}"
   fi
 
-  jq -r --arg dir "${MODEL_SUBDIR}" '.siblings[].rfilename | select(startswith($dir + "/")) | select(endswith(".gguf"))' "${tmp_json}" | sort > "${HF_FILE_LIST}"
-  rm -f "${tmp_json}"
+  mapfile -t SHARD_RELS < <(
+    jq -r '
+      .[]
+      | select(.type == "file")
+      | .path
+      | select(test("(^|/)[^/]+-[0-9]{5}-of-[0-9]{5}\\.gguf$"))
+    ' "${tmp_json}" | sort -V
+  )
 
-  local count
-  count=$(wc -l < "${HF_FILE_LIST}" | tr -d ' ')
-  if [[ "${count}" != "${EXPECTED_SHARDS}" ]]; then
-    log "Discovered files:"
-    sed 's/^/  /' "${HF_FILE_LIST}"
-    sleep_forever "ERROR: discovered ${count} GGUF shard(s), expected exactly ${EXPECTED_SHARDS}."
+  if [[ ${#SHARD_RELS[@]} -ne ${EXPECTED_SHARDS} ]]; then
+    log "Hugging Face API discovered ${#SHARD_RELS[@]} shards; falling back to deterministic ${EXPECTED_SHARDS}-shard list."
+    SHARD_RELS=()
+    local i
+    for i in $(seq -f "%05g" 1 "${EXPECTED_SHARDS}"); do
+      SHARD_RELS+=("${MODEL_PREFIX}/${MODEL_PREFIX}-${i}-of-$(printf "%05d" "${EXPECTED_SHARDS}").gguf")
+    done
   fi
-  log "Discovered exactly ${count} GGUF shard(s)."
+
+  if [[ ${#SHARD_RELS[@]} -ne ${EXPECTED_SHARDS} ]]; then
+    sleep_forever "ERROR: expected ${EXPECTED_SHARDS} shard names but have ${#SHARD_RELS[@]}."
+  fi
+
+  log "Using ${#SHARD_RELS[@]} shard URLs."
 }
 
 write_aria2_input() {
-  mkdir -p "${SHARDS_DIR}"
   : > "${ARIA2_INPUT}"
-  chmod 600 "${ARIA2_INPUT}"
-
-  local rel filename url
-  while IFS= read -r rel; do
-    filename=$(basename "${rel}")
+  chmod 600 "${ARIA2_INPUT}" || true
+  local rel url out target_dir
+  for rel in "${SHARD_RELS[@]}"; do
     url="https://huggingface.co/${MODEL_REPO}/resolve/${REVISION}/${rel}?download=true"
+    out="${rel##*/}"
+    if [[ "${rel}" == */* ]]; then
+      target_dir="${MODEL_DIR}/${rel%/*}"
+      mkdir -p "${target_dir}"
+    else
+      target_dir="${MODEL_DIR}"
+    fi
     {
       printf '%s\n' "${url}"
-      printf '  dir=%s\n' "${SHARDS_DIR}"
-      printf '  out=%s\n' "${filename}"
+      printf '  dir=%s\n' "${target_dir}"
+      printf '  out=%s\n' "${out}"
       if [[ -n "${HF_TOKEN:-}" ]]; then
         printf '  header=Authorization: Bearer %s\n' "${HF_TOKEN}"
       fi
     } >> "${ARIA2_INPUT}"
-  done < "${HF_FILE_LIST}"
+  done
 }
 
 download_shards() {
-  if [[ -s "${MERGED_MODEL}" ]]; then
-    local existing_size
-    existing_size=$(stat -c '%s' "${MERGED_MODEL}")
-    if (( existing_size > MIN_MERGED_BYTES )); then
-      log "Merged model already exists and validates (${existing_size} bytes); skipping shard download."
-      return
-    fi
-  fi
-
-  verify_root_disk
-  create_hf_file_list
+  discover_shards
   write_aria2_input
-
-  log "Downloading ${EXPECTED_SHARDS} GGUF shards with aria2 resume enabled."
+  log "Downloading/resuming shards with aria2: concurrent=${ARIA_CONCURRENT}, split=${ARIA_SPLIT}, connections/server=${ARIA_CONN_PER_SERVER}."
   aria2c \
     --input-file="${ARIA2_INPUT}" \
+    --max-concurrent-downloads="${ARIA_CONCURRENT}" \
+    --split="${ARIA_SPLIT}" \
+    --max-connection-per-server="${ARIA_CONN_PER_SERVER}" \
     --continue=true \
-    --max-connection-per-server=8 \
-    --split=8 \
-    --min-split-size=64M \
     --file-allocation=none \
     --auto-file-renaming=false \
     --allow-overwrite=true \
-    --retry-wait=10 \
-    --max-tries=0 \
-    --summary-interval=60 \
+    --summary-interval="${ARIA_SUMMARY_INTERVAL}" \
     --console-log-level=warn
-
-  local shard_count
-  shard_count=$(find "${SHARDS_DIR}" -maxdepth 1 -type f -name '*.gguf' | wc -l | tr -d ' ')
-  if [[ "${shard_count}" != "${EXPECTED_SHARDS}" ]]; then
-    sleep_forever "ERROR: downloaded ${shard_count} GGUF shard(s), expected exactly ${EXPECTED_SHARDS}."
-  fi
-  log "Downloaded exactly ${shard_count} GGUF shard(s)."
 }
 
-merge_and_validate_model() {
-  mkdir -p "${MERGED_DIR}"
+validate_shards() {
+  mapfile -t SHARD_FILES < <(find "${MODEL_DIR}" -type f -name "${MODEL_PATTERN}" | sort -V)
+  if [[ ${#SHARD_FILES[@]} -ne ${EXPECTED_SHARDS} ]]; then
+    sleep_forever "ERROR: expected ${EXPECTED_SHARDS} shard files in ${MODEL_DIR}, found ${#SHARD_FILES[@]}."
+  fi
+
+  local stats
+  stats=$(python3 - "${SHARD_FILES[@]}" <<'PY'
+import os, sys
+files = sys.argv[1:]
+zeros = [p for p in files if os.path.getsize(p) <= 0]
+total = sum(os.path.getsize(p) for p in files)
+print(f"total={total}")
+print(f"zeros={len(zeros)}")
+PY
+)
+  local total_bytes zero_count
+  total_bytes=$(awk -F= '/^total=/{print $2}' <<< "${stats}")
+  zero_count=$(awk -F= '/^zeros=/{print $2}' <<< "${stats}")
+
+  if (( zero_count > 0 )); then
+    sleep_forever "ERROR: ${zero_count} shard files are empty."
+  fi
+  if (( total_bytes < MIN_TOTAL_BYTES )); then
+    sleep_forever "ERROR: shard total size ${total_bytes} bytes is below 300 GiB; download incomplete."
+  fi
+  log "Validated ${#SHARD_FILES[@]} shards; total size ${total_bytes} bytes."
+}
+
+merge_model() {
   if [[ -s "${MERGED_MODEL}" ]]; then
-    local existing_size
-    existing_size=$(stat -c '%s' "${MERGED_MODEL}")
-    if (( existing_size > MIN_MERGED_BYTES )); then
-      log "Merged model already validates at ${MERGED_MODEL} (${existing_size} bytes)."
-      return
-    fi
-    log "Existing merged model is too small (${existing_size} bytes); replacing it."
-    rm -f "${MERGED_MODEL}"
+    log "Merged model already exists at ${MERGED_MODEL}; validating."
+    "${LLAMA_DIR}/build/bin/llama-cli" --model "${MERGED_MODEL}" --no-warmup --n-predict 1 --prompt "ping" >/tmp/huihui-validate.log 2>&1 || {
+      cat /tmp/huihui-validate.log >&2 || true
+      sleep_forever "ERROR: existing merged model validation failed."
+    }
+    return
   fi
 
-  mapfile -t shard_files < <(find "${SHARDS_DIR}" -maxdepth 1 -type f -name '*.gguf' | sort)
-  if [[ "${#shard_files[@]}" != "${EXPECTED_SHARDS}" ]]; then
-    sleep_forever "ERROR: found ${#shard_files[@]} local shard(s), expected exactly ${EXPECTED_SHARDS} before merge."
+  mkdir -p "$(dirname "${MERGED_MODEL}")"
+  log "Merging ${EXPECTED_SHARDS} shards into ${MERGED_MODEL}. This is skipped when USE_SPLIT_MODEL=1 and MERGE_AFTER_DOWNLOAD=0."
+  "${LLAMA_DIR}/build/bin/llama-gguf-split" --merge "${SHARD_FILES[0]}" "${MERGED_MODEL}"
+  log "Validating merged model metadata."
+  "${LLAMA_DIR}/build/bin/llama-cli" --model "${MERGED_MODEL}" --no-warmup --n-predict 1 --prompt "ping" >/tmp/huihui-validate.log 2>&1 || {
+    cat /tmp/huihui-validate.log >&2 || true
+    sleep_forever "ERROR: merged model validation failed."
+  }
+  if [[ "${CLEAN_RAW_AFTER_MERGE}" == "1" ]]; then
+    log "CLEAN_RAW_AFTER_MERGE=1; removing raw shards after successful merged model validation."
+    rm -f -- "${SHARD_FILES[@]}"
   fi
-
-  log "Merging shards into ${MERGED_MODEL}."
-  "${LLAMA_DIR}/build/bin/llama-gguf-split" --merge "${shard_files[0]}" "${MERGED_MODEL}"
-
-  local merged_size
-  merged_size=$(stat -c '%s' "${MERGED_MODEL}")
-  if (( merged_size <= MIN_MERGED_BYTES )); then
-    sleep_forever "ERROR: merged model is ${merged_size} bytes; expected more than ${MIN_MERGED_BYTES} bytes. Raw shards were kept."
-  fi
-
-  log "Merged model validates (${merged_size} bytes). Removing raw shards to save disk."
-  rm -f "${shard_files[@]}"
-  rm -f "${ARIA2_INPUT}" "${HF_FILE_LIST}"
-  rmdir "${SHARDS_DIR}" 2>/dev/null || true
 }
 
 prepare_api_key() {
   if [[ -n "${LLAMA_API_KEY:-}" ]]; then
     umask 077
     printf '%s' "${LLAMA_API_KEY}" > "${API_KEY_FILE}"
+    API_KEY_SOURCE="env"
   elif [[ ! -s "${API_KEY_FILE}" ]]; then
     umask 077
     openssl rand -hex 32 > "${API_KEY_FILE}"
+    API_KEY_SOURCE="generated"
+  else
+    chmod 600 "${API_KEY_FILE}" || true
+    API_KEY_SOURCE="existing_file"
   fi
-  chmod 600 "${API_KEY_FILE}"
+  chmod 600 "${API_KEY_FILE}" || true
 }
 
-write_ready_json() {
-  local public_host="${PUBLIC_IPADDR:-}"
-  local public_port="${VAST_TCP_PORT_8080:-}"
-  local base_url=""
-  local chat_url=""
-  local timestamp
-  local api_key
-  local tmp_file
-
-  if [[ -n "${public_host}" && -n "${public_port}" ]]; then
-    base_url="http://${public_host}:${public_port}"
-    chat_url="${base_url}/v1/chat/completions"
+compute_public_endpoint() {
+  PUBLIC_HOST="${PUBLIC_IPADDR:-}"
+  local dynamic_vast_var="VAST_TCP_PORT_${PORT}"
+  PUBLIC_PORT="${!dynamic_vast_var:-}"
+  if [[ -z "${PUBLIC_PORT}" && "${PORT}" == "8080" ]]; then
+    PUBLIC_PORT="${VAST_TCP_PORT_8080:-}"
   fi
 
-  timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-  api_key=$(tr -d '\r\n' < "${API_KEY_FILE}")
+  BASE_URL=""
+  CHAT_URL=""
+  if [[ -n "${PUBLIC_HOST}" && -n "${PUBLIC_PORT}" ]]; then
+    BASE_URL="http://${PUBLIC_HOST}:${PUBLIC_PORT}"
+    CHAT_URL="${BASE_URL}/v1/chat/completions"
+  fi
+}
+
+write_ready_files() {
+  prepare_api_key
+  compute_public_endpoint
+  local now api_key
+  now=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+  api_key=$(<"${API_KEY_FILE}")
 
   umask 077
-  tmp_file=$(mktemp "${WORKDIR}/ready.json.tmp.XXXXXX")
   jq -n \
     --arg status "starting" \
-    --arg timestamp "${timestamp}" \
-    --arg model_alias "${MODEL_ALIAS}" \
-    --arg public_host "${public_host}" \
-    --arg public_port "${public_port}" \
-    --arg base_url "${base_url}" \
-    --arg chat_url "${chat_url}" \
+    --arg timestamp "${now}" \
+    --arg model "${MODEL_ALIAS}" \
+    --arg model_id "${MODEL_REPO}" \
+    --arg revision "${REVISION}" \
+    --arg public_host "${PUBLIC_HOST}" \
+    --arg public_port "${PUBLIC_PORT}" \
+    --arg base_url "${BASE_URL}" \
+    --arg chat_url "${CHAT_URL}" \
     --arg api_key_file "${API_KEY_FILE}" \
+    --arg api_key_source "${API_KEY_SOURCE}" \
     --arg api_key "${api_key}" \
-    --arg workdir "${WORKDIR}" \
-    --arg listen_host "0.0.0.0" \
-    --arg listen_port "${PORT}" \
+    --arg port "${PORT}" \
+    --arg ctx "${CTX}" \
+    --arg use_split_model "${USE_SPLIT_MODEL}" \
+    --arg merge_after_download "${MERGE_AFTER_DOWNLOAD}" \
     '{
       status: $status,
       timestamp: $timestamp,
-      model_alias: $model_alias,
+      model: $model,
+      model_id: $model_id,
+      revision: $revision,
       public_host: $public_host,
       public_port: $public_port,
       base_url: $base_url,
       chat_url: $chat_url,
       api_key_file: $api_key_file,
+      api_key_source: $api_key_source,
       api_key: $api_key,
-      workdir: $workdir,
-      listen_host: $listen_host,
-      listen_port: $listen_port,
-      public_endpoint_env_mapping: {
-        public_host: "PUBLIC_IPADDR",
-        public_port_for_container_8080: "VAST_TCP_PORT_8080",
-        base_url: "http://${PUBLIC_IPADDR}:${VAST_TCP_PORT_8080}",
-        chat_url: "http://${PUBLIC_IPADDR}:${VAST_TCP_PORT_8080}/v1/chat/completions"
-      }
-    }' > "${tmp_file}"
-  chmod 600 "${tmp_file}"
-  mv "${tmp_file}" "${READY_JSON}"
+      port: ($port | tonumber),
+      ctx: ($ctx | tonumber),
+      use_split_model: ($use_split_model == "1"),
+      merge_after_download: ($merge_after_download == "1")
+    }' > "${READY_JSON}"
   chmod 600 "${READY_JSON}"
-  log "Wrote startup endpoint metadata to ${READY_JSON} with status starting. Public endpoint maps PUBLIC_IPADDR and VAST_TCP_PORT_8080 to container 8080."
+
+  cat > "${READY_ENV}" <<EOF_READY_ENV
+export LLM_BASE_URL=$(printf '%q' "${BASE_URL}")
+export LLM_CHAT_URL=$(printf '%q' "${CHAT_URL}")
+export LLM_MODEL=$(printf '%q' "${MODEL_ALIAS}")
+export LLM_API_KEY_FILE=$(printf '%q' "${API_KEY_FILE}")
+export LLM_API_KEY=$(printf '%q' "${api_key}")
+EOF_READY_ENV
+  chmod 600 "${READY_ENV}"
+
+  log "Wrote ready metadata to ${READY_JSON} and ${READY_ENV}; API key stored at ${API_KEY_FILE}."
+  if [[ -n "${BASE_URL}" ]]; then
+    log "Public base URL: ${BASE_URL}"
+    log "Public chat URL: ${CHAT_URL}"
+  else
+    log "Public base URL unavailable; PUBLIC_IPADDR and/or VAST_TCP_PORT_${PORT} are not set."
+  fi
 }
 
 post_ready_webhook() {
   if [[ -z "${READY_WEBHOOK_URL:-}" ]]; then
+    log "READY_WEBHOOK_URL is unset; skipping optional webhook."
     return
   fi
 
-  local http_code=""
-  local curl_rc=0
-  set +e
-  http_code=$(curl -sS -o /dev/null -w '%{http_code}' \
-    -X POST \
+  log "Posting ready metadata to optional webhook."
+  if ! curl -fsSL -X POST \
     -H 'Content-Type: application/json' \
     --data-binary "@${READY_JSON}" \
-    "${READY_WEBHOOK_URL}" 2>/dev/null)
-  curl_rc=$?
-  set -e
-
-  if [[ ${curl_rc} -eq 0 && "${http_code}" == 2* ]]; then
-    log "READY_WEBHOOK_URL callback succeeded with HTTP ${http_code}."
-  else
-    log "READY_WEBHOOK_URL callback failed with curl exit ${curl_rc}, HTTP ${http_code:-000}; continuing startup."
+    "${READY_WEBHOOK_URL}" >/tmp/huihui-ready-webhook.out 2>/tmp/huihui-ready-webhook.err; then
+    log "WARNING: READY_WEBHOOK_URL callback failed; continuing startup."
+    cat /tmp/huihui-ready-webhook.err >&2 || true
   fi
 }
 
+choose_model_path() {
+  SERVER_MODEL="${SHARD_FILES[0]}"
+  if [[ "${USE_SPLIT_MODEL}" == "1" && "${MERGE_AFTER_DOWNLOAD}" != "1" ]]; then
+    log "USE_SPLIT_MODEL=1; using first split shard directly and skipping merged-model creation."
+    return
+  fi
+
+  merge_model
+  SERVER_MODEL="${MERGED_MODEL}"
+}
+
 start_server() {
-  prepare_api_key
-  write_ready_json
+  choose_model_path
+  write_ready_files
   post_ready_webhook
   log "Starting llama-server on 0.0.0.0:${PORT} with alias ${MODEL_ALIAS}. API key is stored at ${API_KEY_FILE}."
   exec "${LLAMA_DIR}/build/bin/llama-server" \
     --host 0.0.0.0 \
     --port "${PORT}" \
-    --model "${MERGED_MODEL}" \
+    --model "${SERVER_MODEL}" \
     --alias "${MODEL_ALIAS}" \
     --api-key-file "${API_KEY_FILE}" \
     --ctx-size "${CTX}" \
-    --n-gpu-layers -1 \
+    --n-gpu-layers 999 \
     --split-mode layer \
     --tensor-split 1,1,1,1,1,1,1,1 \
     --batch-size 1024 \
@@ -377,14 +415,13 @@ start_server() {
 }
 
 main() {
-  log "Starting Vast.ai Huihui GLM-5.1 Q3_K deployment."
   require_root
-  verify_gpus
-  install_dependencies
+  log_config
+  install_packages
+  check_gpus
   clone_or_update_llama_cpp
-  build_llama_cpp
   download_shards
-  merge_and_validate_model
+  validate_shards
   start_server
 }
 
